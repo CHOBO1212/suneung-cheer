@@ -264,6 +264,26 @@
             padding-bottom: 24px;
         }
 
+        .sound-ctl {
+            position: fixed;
+            right: 16px;
+            bottom: 16px;
+            display: flex;
+            gap: 8px;
+            z-index: 10;
+        }
+
+            .sound-ctl button {
+                padding: 8px 14px;
+                font-size: .85rem;
+                background: #fff;
+                box-shadow: 0 3px 0 var(--ink);
+            }
+
+                .sound-ctl button[aria-pressed="true"] {
+                    background: #ffe066;
+                }
+
         @media (max-width: 480px) {
             #board {
                 grid-template-columns: repeat(2, 1fr);
@@ -299,6 +319,11 @@
 
     <main id="board" aria-live="polite"></main>
     <footer>최신 응원 50개만 표시됩니다</footer>
+
+    <div class="sound-ctl">
+        <button id="musicBtn" type="button" aria-pressed="false">🎵 배경음악 켜기</button>
+        <button id="sfxBtn" type="button" aria-pressed="true">🔊 효과음</button>
+    </div>
 
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <script>
@@ -386,7 +411,260 @@
             cheers.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
             cheers = cheers.slice(0, MAX_SHOW);                    // 최신 50개 유지
             render(c.id);
+            Sound.paper();                                         // 포스트잇 붙는 소리
         }
+
+        /* ================================================================
+           사운드 : 외부 파일 없이 Web Audio API로 직접 합성
+           - 배경음악: 피아노 분산화음 + 현악 선율, 홀 잔향 (파헬벨 「캐논」 코드 진행, 1680년경 작품으로 저작권 만료)
+           - 효과음: 포스트잇을 손가락으로 "쓱" 눌러 펴는 소리 (낮은 음역 제거)
+           ================================================================ */
+        const SFX_VOLUME = 0.5;   // 효과음 크기 (1 = 원래 크기, 0.5 = 절반). 더 줄이려면 이 숫자만 낮추면 됨
+        const midiHz = (m) => 440 * Math.pow(2, (m - 69) / 12);
+
+        function makeNoise(ac) {
+            const buf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+            const d = buf.getChannelData(0);
+            for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+            return buf;
+        }
+
+        function envGain(ac, t, peak, attack, release) {
+            const g = ac.createGain();
+            g.gain.setValueAtTime(0.0001, t);
+            g.gain.exponentialRampToValueAtTime(peak, t + attack);
+            g.gain.exponentialRampToValueAtTime(0.0001, t + attack + release);
+            return g;
+        }
+
+        /* 홀 잔향용 임펄스 (노이즈가 2.4초에 걸쳐 사라지는 모양) */
+        function makeHallImpulse(ac, sec = 2.4) {
+            const len = Math.floor(ac.sampleRate * sec);
+            const buf = ac.createBuffer(2, len, ac.sampleRate);
+            for (let c = 0; c < 2; c++) {
+                const d = buf.getChannelData(c);
+                for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3.2);
+            }
+            return buf;
+        }
+
+        /* 포스트잇 눌러 붙이는 소리 : t초에 시작, 약 0.3초
+           손가락으로 "쓱" 쓸어 펴는 마찰음 하나만. 낮은 음(700Hz↓)과 귀를 찌르는 높은 음(9kHz↑)은 잘라 부드럽게 */
+        function synthPaper(ac, out, t, noise) {
+            const dur = 0.26 + Math.random() * 0.05;      // 매번 길이·결이 조금씩 달라 자연스럽게
+
+            const hp = ac.createBiquadFilter();
+            hp.type = "highpass"; hp.frequency.value = 700; hp.Q.value = 0.6;
+            const lp = ac.createBiquadFilter();
+            lp.type = "lowpass"; lp.frequency.value = 9000; lp.Q.value = 0.5;
+            hp.connect(lp).connect(out);
+
+            // 쓸어내리는 손의 힘 곡선: 빠르게 커졌다가(약 35% 지점) 천천히 잦아듦
+            const N = 64, curve = (peak) => {
+                const c = new Float32Array(N);
+                for (let i = 0; i < N; i++) {
+                    const x = i / (N - 1);
+                    c[i] = Math.max(0.0001, peak * Math.pow(Math.sin(Math.PI * Math.pow(x, 0.7)), 1.6));
+                }
+                return c;
+            };
+
+            // ① 몸통: 종이 면을 문지르는 "스—" (손이 움직이며 음색이 조금 밝아짐)
+            const body = ac.createBufferSource();
+            body.buffer = noise;
+            const bf = ac.createBiquadFilter();
+            bf.type = "bandpass"; bf.Q.value = 0.7;
+            bf.frequency.setValueAtTime(1700, t);
+            bf.frequency.linearRampToValueAtTime(2900, t + dur);
+            const bg = ac.createGain();
+            bg.gain.setValueAtTime(0.0001, t);
+            bg.gain.setValueCurveAtTime(curve(0.26), t, dur);
+            body.connect(bf).connect(bg).connect(hp);
+            body.start(t, Math.random() * 0.6, dur + 0.02);
+
+            // ② 결: 손끝과 종이 섬유가 스치는 잘게 부서지는 고음. 불규칙하게 흔들어 "사각" 질감을 줌
+            const grain = ac.createBufferSource();
+            grain.buffer = noise;
+            const gf = ac.createBiquadFilter();
+            gf.type = "highpass"; gf.frequency.value = 4500;
+            const gEnv = ac.createGain();
+            gEnv.gain.setValueAtTime(0.0001, t);
+            gEnv.gain.setValueCurveAtTime(curve(0.11), t, dur);
+            const jitter = ac.createGain();                  // 불규칙 떨림
+            jitter.gain.value = 0.6;
+            const mod = ac.createBufferSource();
+            mod.buffer = noise;
+            const mf = ac.createBiquadFilter();
+            mf.type = "lowpass"; mf.frequency.value = 45;
+            const mAmt = ac.createGain(); mAmt.gain.value = 3;
+            mod.connect(mf).connect(mAmt).connect(jitter.gain);
+            grain.connect(gf).connect(gEnv).connect(jitter).connect(hp);
+            grain.start(t, Math.random() * 0.6, dur + 0.02);
+            mod.start(t, Math.random() * 0.6, dur + 0.02);
+        }
+
+        /* ---- 배경음악 ---- */
+        const BPM = 66;
+        const STEP = 60 / BPM / 4;                   // 16분음표
+        const STEPS_PER_CHORD = 8;                   // 화음 하나 = 2박
+        // 파헬벨 「캐논」 진행을 C장조로: C - G/B - Am - Em/G - F - C/E - F - G
+        // [베이스, 분산화음 4음, 현악 선율음]
+        const CANON = [
+            [48, [60, 64, 67, 72], 76],
+            [47, [59, 62, 67, 71], 74],
+            [45, [57, 60, 64, 69], 72],
+            [43, [55, 59, 64, 67], 71],
+            [41, [57, 60, 65, 69], 69],
+            [40, [55, 60, 64, 67], 67],
+            [41, [57, 60, 65, 69], 69],
+            [43, [59, 62, 67, 71], 71],
+        ];
+        const ARP = [0, 1, 2, 3, 1, 2, 3, 2];          // 바흐 프렐류드풍 분산화음 순서
+
+        /* 피아노 한 음: 배음마다 감쇠 속도를 달리해 "띵—" 하고 자연스럽게 사라지게 */
+        function piano(ac, out, t, m, vel) {
+            const f = midiHz(m);
+            const len = Math.max(1.2, 3.2 - (m - 40) * 0.04);   // 낮은 음일수록 길게 울림
+            const g = ac.createGain();
+            g.gain.value = vel;
+            g.connect(out);
+            [[1, 1], [2, 0.42], [3, 0.2], [4, 0.1], [5, 0.05]].forEach(([n, a], i) => {
+                const o = ac.createOscillator();
+                o.type = "sine";
+                o.frequency.value = f * n * (1 + 0.0004 * n * n);   // 피아노 특유의 약간 높아지는 배음
+                o.connect(envGain(ac, t, a, 0.004, len / (1 + i * 0.8))).connect(g);
+                o.start(t); o.stop(t + len + 0.05);
+            });
+        }
+
+        /* 현악기 한 음: 톱니파 두 개 + 비브라토, 천천히 커졌다 사라짐 */
+        function strings(ac, out, t, m, dur, vol) {
+            const lp = ac.createBiquadFilter();
+            lp.type = "lowpass"; lp.frequency.value = 1700; lp.Q.value = 0.5;
+            const g = ac.createGain();
+            g.gain.setValueAtTime(0.0001, t);
+            g.gain.exponentialRampToValueAtTime(vol, t + 0.45);
+            g.gain.setValueAtTime(vol, t + dur - 0.1);
+            g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.6);
+            lp.connect(g).connect(out);
+            const vib = ac.createOscillator();
+            vib.frequency.value = 5.2;
+            const vibAmt = ac.createGain(); vibAmt.gain.value = 7;      // ±7센트
+            vib.connect(vibAmt);
+            for (const det of [-5, 5]) {
+                const o = ac.createOscillator();
+                o.type = "sawtooth";
+                o.frequency.value = midiHz(m);
+                o.detune.value = det;
+                vibAmt.connect(o.detune);
+                o.connect(lp);
+                o.start(t); o.stop(t + dur + 0.7);
+            }
+            vib.start(t); vib.stop(t + dur + 0.7);
+        }
+
+        function synthMusicStep(ac, out, t, step) {
+            const inChord = step % STEPS_PER_CHORD;
+            const chordIdx = Math.floor(step / STEPS_PER_CHORD);
+            const [bass, arp, mel] = CANON[chordIdx % CANON.length];
+            const round = Math.floor(chordIdx / CANON.length) % 3;   // 1회차: 피아노만 → 2회차: 현악 선율 → 3회차: 한 옥타브 위 선율 + 첼로
+            const chordLen = STEP * STEPS_PER_CHORD;
+
+            // 피아노: 첫 박은 조금 세게, 나머지는 여리게
+            if (inChord === 0) piano(ac, out, t, bass, 0.075);
+            piano(ac, out, t, arp[ARP[inChord]], inChord === 0 ? 0.05 : 0.034);
+
+            if (inChord === 0 && round >= 1) {
+                strings(ac, out, t, round === 2 ? mel + 12 : mel, chordLen, 0.016);
+                if (round === 2) strings(ac, out, t, bass, chordLen, 0.014);
+            }
+        }
+
+        const Sound = (() => {
+            let ac = null, musicBus, sfxBus, noise, timer = null, nextTime = 0, step = 0;
+            let musicOn = false, sfxOn = true;
+            try { sfxOn = localStorage.getItem("cheer-sfx") !== "off"; } catch (e) { }
+
+            function init() {      // 브라우저 정책상 사용자가 클릭/입력한 뒤에만 소리를 낼 수 있음
+                if (!ac) {
+                    const AC = window.AudioContext || window.webkitAudioContext;
+                    if (!AC) return null;
+                    ac = new AC();
+                    noise = makeNoise(ac);
+                    const master = ac.createGain();
+                    master.gain.value = 0.8;
+                    master.connect(ac.destination);
+                    sfxBus = ac.createGain();
+                    sfxBus.gain.value = SFX_VOLUME;
+                    sfxBus.connect(master);
+                    musicBus = ac.createGain();
+                    musicBus.gain.value = 0;
+                    // 콘서트홀 같은 잔향
+                    const dry = ac.createGain();
+                    const hall = ac.createConvolver();
+                    hall.buffer = makeHallImpulse(ac);
+                    const wet = ac.createGain(); wet.gain.value = 0.32;
+                    dry.connect(musicBus);
+                    dry.connect(hall).connect(wet).connect(musicBus);
+                    musicBus.connect(master);
+                    musicBus.input = dry;
+                }
+                if (ac.state === "suspended") ac.resume();
+                return ac;
+            }
+
+            function scheduler() {
+                while (nextTime < ac.currentTime + 0.25) {
+                    synthMusicStep(ac, musicBus.input, nextTime, step++);
+                    nextTime += STEP;
+                }
+            }
+
+            function setMusic(on) {
+                if (!init()) return;
+                musicOn = on;
+                const now = ac.currentTime;
+                musicBus.gain.cancelScheduledValues(now);
+                musicBus.gain.setTargetAtTime(on ? 1 : 0, now, on ? 0.6 : 0.3);
+                if (on && !timer) {
+                    nextTime = now + 0.1; step = 0;
+                    timer = setInterval(scheduler, 50);
+                } else if (!on && timer) {
+                    const t = timer; timer = null;
+                    setTimeout(() => { if (!musicOn) clearInterval(t); else timer = t; }, 1500);
+                }
+            }
+
+            return {
+                unlock: () => init(),
+                get musicOn() { return musicOn; },
+                get sfxOn() { return sfxOn; },
+                toggleMusic() { setMusic(!musicOn); return musicOn; },
+                toggleSfx() {
+                    sfxOn = !sfxOn;
+                    try { localStorage.setItem("cheer-sfx", sfxOn ? "on" : "off"); } catch (e) { }
+                    return sfxOn;
+                },
+                paper() {
+                    // 아직 한 번도 클릭하지 않은 방문자에게는 조용히 건너뜀(자동재생 차단 정책)
+                    if (!sfxOn || !ac || ac.state !== "running") return;
+                    synthPaper(ac, sfxBus, ac.currentTime + 0.16, noise);   // 떨어지는 애니메이션(0.45초)이 판에 처음 닿는 0.16초에 맞춤
+                },
+            };
+        })();
+
+        const musicBtn = $("musicBtn"), sfxBtn = $("sfxBtn");
+        function syncSoundButtons() {
+            musicBtn.setAttribute("aria-pressed", String(Sound.musicOn));
+            musicBtn.textContent = Sound.musicOn ? "🎵 배경음악 끄기" : "🎵 배경음악 켜기";
+            sfxBtn.setAttribute("aria-pressed", String(Sound.sfxOn));
+            sfxBtn.textContent = Sound.sfxOn ? "🔊 효과음" : "🔇 효과음";
+        }
+        musicBtn.addEventListener("click", () => { Sound.toggleMusic(); syncSoundButtons(); });
+        sfxBtn.addEventListener("click", () => { Sound.toggleSfx(); syncSoundButtons(); });
+        // 페이지 어디든 처음 누르거나 입력하면 오디오 잠금 해제 → 이후 다른 사람 응원에도 효과음
+        ["pointerdown", "keydown"].forEach((ev) => document.addEventListener(ev, () => Sound.unlock(), { once: true }));
+        syncSoundButtons();
 
         /* ---- Supabase ---- */
         const configured = !SUPABASE_URL.includes("YOUR-PROJECT") && !SUPABASE_KEY.startsWith("YOUR-");
@@ -459,7 +737,7 @@
             input.value = "";
             input.dispatchEvent(new Event("input"));
             showMsg("응원이 붙었어요! 💛");
-            if (!realtimeOk) loadLatest();           // 실시간이 끊겨 있으면 직접 갱신
+            if (!realtimeOk) { Sound.paper(); loadLatest(); }   // 실시간이 끊겨 있으면 직접 갱신(소리도 여기서)
         });
 
         refreshBtn.addEventListener("click", loadLatest);
